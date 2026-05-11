@@ -1,0 +1,358 @@
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')          # change to 'Agg' for headless / frame-saving
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  WORLD
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+WORLD_W = 10.0
+WORLD_H =  8.0
+ 
+WALLS = [
+    (0, 0, WORLD_W, 0),
+    (WORLD_W, 0, WORLD_W, WORLD_H),
+    (WORLD_W, WORLD_H, 0, WORLD_H),
+    (0, WORLD_H, 0, 0),
+    (3, 0, 3, 4),
+    (5, 4, 5, WORLD_H),
+    (7, 1, 7, 6),
+]
+ 
+# Hard-coded route — designer knows the map.
+# Final waypoint returns to origin → causes wall pass-through bug.
+WAYPOINTS = [
+    (1.0, 1.0), (2.0, 6.5), (4.0, 6.5), (4.0, 1.5),
+    (6.0, 1.5), (6.0, 5.5), (8.5, 5.5), (8.5, 1.5),
+    (1.0, 1.0),
+]
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+N_PARTICLES      = 200
+N_BEAMS          = 24
+MAX_RANGE        = 8.0          # lidar max range (m)
+ 
+MOTION_NOISE_XY  = 0.05         # std dev of position noise per step (m)
+MOTION_NOISE_TH  = 0.02         # std dev of heading noise per step (rad)
+SENSOR_NOISE_STD = 0.15         # std dev of lidar noise (m)
+ 
+# Occupancy grid
+GRID_RES  = 0.1                 # metres per cell
+GRID_COLS = int(WORLD_W / GRID_RES)
+GRID_ROWS = int(WORLD_H / GRID_RES)
+L_OCC     =  0.85               # log-odds added on beam hit
+L_FREE    = -0.40               # log-odds added on beam pass-through
+L_MIN     = -5.0
+L_MAX     =  5.0
+ 
+# Controller
+LINEAR_SPEED  = 0.12            # m per step
+ANGULAR_GAIN  = 1.5
+ARRIVE_DIST   = 0.3             # consider waypoint reached (m)
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  GEOMETRY
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def ray_segment_intersect(rx, ry, angle, x1, y1, x2, y2):
+    """
+    Distance along ray (rx,ry,angle) to segment (x1,y1)-(x2,y2).
+    Returns MAX_RANGE if no intersection.
+ 
+    BUG (fixed in v7): fails for rays exactly parallel to the wall
+    (collinear case) — returns MAX_RANGE even when the ray grazes the wall.
+    """
+    dx, dy = np.cos(angle), np.sin(angle)
+    wx, wy = x2 - x1, y2 - y1
+    denom = dx * wy - dy * wx
+    if abs(denom) < 1e-10:
+        return MAX_RANGE          # parallel — will miss collinear walls
+    t = ((x1 - rx) * wy - (y1 - ry) * wx) / denom
+    s = ((x1 - rx) * dy - (y1 - ry) * dx) / denom
+    if 0 < t < MAX_RANGE and 0 <= s <= 1:
+        return t
+    return MAX_RANGE
+ 
+ 
+def cast_ray(rx, ry, angle):
+    return min(ray_segment_intersect(rx, ry, angle, *w) for w in WALLS)
+ 
+ 
+def take_scan(rx, ry, rtheta, noise_std=0.0):
+    """24-beam lidar scan from pose (rx, ry, rtheta)."""
+    angles = rtheta + np.linspace(0, 2*np.pi, N_BEAMS, endpoint=False)
+    ranges = np.array([cast_ray(rx, ry, a) for a in angles])
+    if noise_std > 0:
+        ranges += np.random.normal(0, noise_std, N_BEAMS)
+        ranges  = np.clip(ranges, 0, MAX_RANGE)
+    return ranges
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  OCCUPANCY GRID
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+class OccupancyGrid:
+    def __init__(self):
+        self.log_odds = np.zeros((GRID_ROWS, GRID_COLS))
+ 
+    def world_to_grid(self, wx, wy):
+        c = int(np.clip(wx / GRID_RES, 0, GRID_COLS - 1))
+        r = int(np.clip(wy / GRID_RES, 0, GRID_ROWS - 1))
+        return r, c
+ 
+    def update(self, rx, ry, rtheta, scan):
+        angles = rtheta + np.linspace(0, 2*np.pi, N_BEAMS, endpoint=False)
+        for a, d in zip(angles, scan):
+            if d >= MAX_RANGE:
+                continue
+            # free cells along beam
+            n = int(d / GRID_RES)
+            for s in range(n):
+                wx = rx + np.cos(a) * s * GRID_RES
+                wy = ry + np.sin(a) * s * GRID_RES
+                r, c = self.world_to_grid(wx, wy)
+                self.log_odds[r, c] = np.clip(self.log_odds[r, c] + L_FREE,
+                                               L_MIN, L_MAX)
+            # hit cell
+            wx = rx + np.cos(a) * d
+            wy = ry + np.sin(a) * d
+            r, c = self.world_to_grid(wx, wy)
+            self.log_odds[r, c] = np.clip(self.log_odds[r, c] + L_OCC,
+                                            L_MIN, L_MAX)
+ 
+    def probability_map(self):
+        return 1.0 / (1.0 + np.exp(-self.log_odds))
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  PARTICLE FILTER
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def init_particles(x, y, theta):
+    p = np.zeros((N_PARTICLES, 3))
+    p[:, 0] = x
+    p[:, 1] = y
+    p[:, 2] = theta
+    return p
+ 
+ 
+def predict(particles, dx, dy, dtheta):
+    """
+    Motion model: apply odometry + Gaussian noise.
+    Equivalent to sampling from the process model p(x_t | x_{t-1}, u_t).
+    """
+    particles[:, 0] += dx + np.random.normal(0, MOTION_NOISE_XY, N_PARTICLES)
+    particles[:, 1] += dy + np.random.normal(0, MOTION_NOISE_XY, N_PARTICLES)
+    particles[:, 2] += dtheta + np.random.normal(0, MOTION_NOISE_TH, N_PARTICLES)
+    return particles
+ 
+ 
+def compute_weights(particles, z_actual):
+    """
+    Sensor model: w_i ∝ exp(-Σ_k (z_k - ẑ_k^(i))² / 2σ²)
+ 
+    NOTE (v1 limitation): ẑ_k^(i) is computed by ray-casting against the
+    KNOWN walls, not against each particle's own map. This is localisation
+    in a known map, not true SLAM. Fixed in v2 (true_slam.py).
+    """
+    log_w = np.zeros(N_PARTICLES)
+    for i, (px, py, pth) in enumerate(particles):
+        z_hat  = take_scan(px, py, pth, noise_std=0.0)
+        diff   = z_actual - z_hat
+        log_w[i] = -0.5 * np.sum(diff**2) / (SENSOR_NOISE_STD**2)
+    log_w -= log_w.max()
+    w = np.exp(log_w)
+    w /= w.sum()
+    return w
+ 
+ 
+def resample(particles, weights):
+    """Systematic resampling — O(N), low variance."""
+    N   = N_PARTICLES
+    pos = (np.arange(N) + np.random.uniform()) / N
+    cum = np.cumsum(weights)
+    idx = np.searchsorted(cum, pos)
+    return particles[idx].copy()
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  CONTROLLER  (proportional, no collision awareness)
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def compute_control(rx, ry, rtheta, tx, ty):
+    """
+    Drive toward (tx, ty) with a proportional angular controller.
+    No collision checking — will drive through walls on last waypoint.
+    """
+    dist = np.hypot(tx - rx, ty - ry)
+    if dist < ARRIVE_DIST:
+        return 0.0, 0.0, 0.0
+ 
+    target_angle = np.arctan2(ty - ry, tx - rx)
+    angle_err    = (target_angle - rtheta + np.pi) % (2*np.pi) - np.pi
+    dtheta       = np.clip(ANGULAR_GAIN * angle_err, -0.3, 0.3)
+    scale        = max(0.0, 1.0 - abs(angle_err) / (np.pi/4))
+    dx = np.cos(rtheta) * LINEAR_SPEED * scale
+    dy = np.sin(rtheta) * LINEAR_SPEED * scale
+    return dx, dy, dtheta
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  VISUALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def draw_walls(ax):
+    for x1, y1, x2, y2 in WALLS:
+        ax.plot([x1, x2], [y1, y2], 'w-', lw=1.5, alpha=0.8)
+ 
+ 
+def setup_figure():
+    fig = plt.figure(figsize=(13, 6), facecolor='#1a1a2e')
+    gs  = GridSpec(1, 2, figure=fig, left=0.05, right=0.97,
+                   bottom=0.08, top=0.88, wspace=0.25)
+    ax1 = fig.add_subplot(gs[0])
+    ax2 = fig.add_subplot(gs[1])
+    for ax in (ax1, ax2):
+        ax.set_facecolor('#16213e')
+        ax.tick_params(colors='#aaa')
+        for sp in ax.spines.values():
+            sp.set_color('#333355')
+    ax1.set_title('Ground truth + particle cloud', color='white', fontsize=9)
+    ax2.set_title('Occupancy grid (estimated map)', color='white', fontsize=9)
+    return fig, ax1, ax2
+ 
+ 
+def render(fig, ax1, ax2, step,
+           true_x, true_y, true_theta, true_path,
+           particles, weights,
+           ex, ey, grid, target_wp):
+ 
+    ax1.cla(); ax2.cla()
+    ax1.set_facecolor('#16213e'); ax2.set_facecolor('#16213e')
+ 
+    # ── ax1: world ──
+    draw_walls(ax1)
+ 
+    # Particle cloud — colour encodes weight
+    w_norm = weights / weights.max()
+    ax1.scatter(particles[:, 0], particles[:, 1],
+                c=w_norm, cmap='plasma', s=6, alpha=0.6, zorder=3,
+                label='Particles')
+ 
+    # True path
+    if len(true_path) > 1:
+        px, py = zip(*true_path)
+        ax1.plot(px, py, '-', color='#2ecc71', lw=1, alpha=0.4,
+                 label='True path')
+ 
+    # True pose
+    ax1.plot(true_x, true_y, 'o', color='#2ecc71', ms=7, zorder=5)
+    ax1.annotate('', xy=(true_x + 0.5*np.cos(true_theta),
+                          true_y + 0.5*np.sin(true_theta)),
+                 xytext=(true_x, true_y),
+                 arrowprops=dict(arrowstyle='->', color='#2ecc71', lw=2))
+ 
+    # Waypoints
+    for wpx, wpy in WAYPOINTS:
+        ax1.plot(wpx, wpy, '+', color='#9b59b6',
+                 ms=8, markeredgewidth=1.5, zorder=4)
+ 
+    if target_wp:
+        ax1.plot(*target_wp, 'x', color='yellow', ms=12, markeredgewidth=2)
+ 
+    ax1.set_xlim(0, WORLD_W); ax1.set_ylim(0, WORLD_H)
+    ax1.set_aspect('equal')
+    ax1.legend(loc='upper right', fontsize=7,
+               facecolor='#1a1a2e', labelcolor='white', edgecolor='#444')
+    ax1.set_xlabel('x (m)', color='#aaa')
+    ax1.set_ylabel('y (m)', color='#aaa')
+ 
+    # ── ax2: occupancy grid ──
+    prob_map = grid.probability_map()
+    ax2.imshow(prob_map, origin='lower', cmap='gray_r',
+               extent=[0, WORLD_W, 0, WORLD_H],
+               vmin=0, vmax=1, interpolation='nearest')
+    draw_walls(ax2)
+    ax2.plot(ex, ey, 's', color='#2ecc71', ms=8, zorder=6)
+    ax2.set_xlabel('x (m)', color='#aaa')
+    ax2.set_ylabel('y (m)', color='#aaa')
+ 
+    err = np.sqrt((true_x - ex)**2 + (true_y - ey)**2)
+    fig.suptitle(f'Step {step:4d}   |   Localisation error: {err:.3f} m   |'
+                 f'   Particles: {N_PARTICLES}',
+                 color='white', fontsize=11)
+    plt.pause(0.01)
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  MAIN LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def run_simulation():
+    x0, y0  = WAYPOINTS[0]
+    true_x, true_y, true_theta = x0, y0, 0.0
+ 
+    particles = init_particles(true_x, true_y, true_theta)
+    weights   = np.ones(N_PARTICLES) / N_PARTICLES
+    grid      = OccupancyGrid()
+    true_path = [(true_x, true_y)]
+    wp_idx    = 1
+ 
+    plt.ion()
+    fig, ax1, ax2 = setup_figure()
+ 
+    step = 0
+    while wp_idx < len(WAYPOINTS):
+        tx, ty = WAYPOINTS[wp_idx]
+        dx, dy, dtheta = compute_control(true_x, true_y, true_theta, tx, ty)
+ 
+        if dx == 0 and dy == 0 and dtheta == 0:
+            wp_idx += 1
+            continue
+ 
+        # Propagate true robot
+        true_x     += dx
+        true_y     += dy
+        true_theta += dtheta
+        true_theta  = (true_theta + np.pi) % (2*np.pi) - np.pi
+        true_x = np.clip(true_x, 0.05, WORLD_W - 0.05)
+        true_y = np.clip(true_y, 0.05, WORLD_H - 0.05)
+        true_path.append((true_x, true_y))
+ 
+        # Sense
+        z = take_scan(true_x, true_y, true_theta, noise_std=SENSOR_NOISE_STD)
+ 
+        # Particle filter
+        particles = predict(particles, dx, dy, dtheta)
+        weights   = compute_weights(particles, z)
+        particles = resample(particles, weights)
+ 
+        # Best particle → pose estimate
+        best = np.argmax(weights)
+        ex, ey, _ = particles[best]
+ 
+        # Update occupancy grid from estimated pose
+        grid.update(ex, ey, particles[best, 2], z)
+ 
+        # Render every 5 steps
+        if step % 5 == 0:
+            target = WAYPOINTS[wp_idx] if wp_idx < len(WAYPOINTS) else None
+            render(fig, ax1, ax2, step,
+                   true_x, true_y, true_theta, true_path,
+                   particles, weights, ex, ey, grid, target)
+ 
+        step += 1
+ 
+    plt.ioff()
+    plt.savefig('/mnt/user-data/outputs/v1_slam_final.png',
+                dpi=150, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+    print(f'Done. Final localisation error: '
+          f'{np.sqrt((true_x-ex)**2 + (true_y-ey)**2):.4f} m')
+    plt.show()
+ 
+ 
+if __name__ == '__main__':
+    np.random.seed(42)
+    run_simulation()
