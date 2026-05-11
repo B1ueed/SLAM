@@ -1,7 +1,7 @@
 """
 2D Particle Filter SLAM — v4c: Locality/Certainty Scoring + Cluster Merging + Direction Heuristic
 =========================================================================
-Adds on top of v3:
+On top of v3:
   - A* for path planning (once best frontier chosen)
   - Live centroid recomputation every step
   - Information gain scoring: score = info_gain^1.5 / (path_dist+1) * recency
