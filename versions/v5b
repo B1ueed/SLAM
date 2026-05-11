@@ -1,0 +1,619 @@
+"""
+2D Particle Filter SLAM — v5b: Robot Speed Halved + Waypoint Timeout Fixed
+=========================================================================
+Adds on top of v3:
+  - A* for path planning (once best frontier chosen)
+  - Live centroid recomputation every step
+  - Information gain scoring: score = info_gain^1.5 / (path_dist+1) * recency
+  - Recency penalty (×0.5 per failure) instead of blacklist
+  - [REMOVED] Medial axis edge weights in A*
+  - Sparse waypoint pruning (keep only direction-change cells, angle > 0.3 rad)
+  - Pocket fallback (drop medial axis when ≤3 frontiers remain)
+  - Event-driven replan triggers:
+      * Centroid drifts > MAX_CENTROID_DRIFT cells
+      * Cluster dissolves (< MIN_FRONTIER_SIZE cells remain)
+      * Current waypoint blocked by newly-mapped wall
+      * Robot stuck > MAX_STUCK_STEPS without progress
+
+NOTE: Medial axis is removed in v4b.
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import heapq
+import os
+
+OUTPUT_DIR = 'slam_output'
+FRAMES_DIR = os.path.join(OUTPUT_DIR, 'frames')
+os.makedirs(FRAMES_DIR, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  WORLD
+# ─────────────────────────────────────────────────────────────────────────────
+
+WORLD_W = 10.0
+WORLD_H =  8.0
+
+WALLS = [
+    (0, 0, WORLD_W, 0),
+    (WORLD_W, 0, WORLD_W, WORLD_H),
+    (WORLD_W, WORLD_H, 0, WORLD_H),
+    (0, WORLD_H, 0, 0),
+    (3, 0, 3, 4),
+    (5, 4, 5, WORLD_H),
+    (7, 1, 7, 6),
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+N_PARTICLES      = 150
+N_BEAMS          = 24
+MAX_RANGE        = 8.0
+
+MOTION_NOISE_XY  = 0.05
+MOTION_NOISE_TH  = 0.02
+SENSOR_NOISE_STD = 0.15
+
+GRID_RES  = 0.25
+GRID_COLS = int(WORLD_W / GRID_RES)
+GRID_ROWS = int(WORLD_H / GRID_RES)
+L_OCC     =  0.85
+L_FREE    = -0.40
+L_MIN     = -5.0
+L_MAX     =  5.0
+
+FREE_THRESH    = -0.1
+UNKNOWN_THRESH =  0.1
+OCC_THRESH     =  0.5
+
+INFLATION_RADIUS      = 1
+MIN_FRONTIER_SIZE     = 3
+RECENCY_DECAY         = 0.5
+MAX_CENTROID_DRIFT    = 5      # grid cells
+# MAX_STUCK_STEPS replaced by MAX_STEPS_PER_WAYPOINT above (v5b)
+MERGE_RADIUS          = 5      # grid cells — clusters closer than this get merged
+LOCALITY_LAMBDA       = 0.05   # exponential locality decay constant
+DIRECTION_WEIGHT      = 2.0    # bonus for frontiers in current travel direction
+
+# Waypoint pruning
+WAYPOINT_ANGLE_TOL    = 0.3    # radians — keep cells where heading changes more than this
+
+ROBOT_SPEED   = 0.06          # halved from 0.12 — more lidar observations per metre
+                                   # at 0.12 m/step a wall saw 2-3 beams; at 0.06 it gets ~6
+ANGULAR_GAIN  = 2.0
+ARRIVE_DIST   = 0.3
+MAX_STEPS_PER_WAYPOINT = 120  # was 60 — doubled to match halved speed (same effective timeout distance)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  GEOMETRY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ray_segment_intersect(rx, ry, angle, x1, y1, x2, y2):
+    dx, dy = np.cos(angle), np.sin(angle)
+    wx, wy = x2 - x1, y2 - y1
+    denom  = dx * wy - dy * wx
+    if abs(denom) < 1e-10:
+        return MAX_RANGE
+    t = ((x1 - rx) * wy - (y1 - ry) * wx) / denom
+    s = ((x1 - rx) * dy - (y1 - ry) * dx) / denom
+    if 0 < t < MAX_RANGE and 0 <= s <= 1:
+        return t
+    return MAX_RANGE
+
+def cast_ray(rx, ry, angle):
+    return min(ray_segment_intersect(rx, ry, angle, *w) for w in WALLS)
+
+def take_scan(rx, ry, rtheta, noise_std=0.0):
+    angles = rtheta + np.linspace(0, 2*np.pi, N_BEAMS, endpoint=False)
+    ranges = np.array([cast_ray(rx, ry, a) for a in angles])
+    if noise_std > 0:
+        ranges += np.random.normal(0, noise_std, N_BEAMS)
+        ranges  = np.clip(ranges, 0, MAX_RANGE)
+    return ranges
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  OCCUPANCY GRID
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OccupancyGrid:
+    def __init__(self):
+        self.log_odds     = np.zeros((GRID_ROWS, GRID_COLS))
+        self.update_counts = np.zeros((GRID_ROWS, GRID_COLS), dtype=np.int32)  # v5a
+
+    def in_bounds(self, r, c):
+        return 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS
+
+    def world_to_grid(self, wx, wy):
+        return (int(np.clip(wy / GRID_RES, 0, GRID_ROWS-1)),
+                int(np.clip(wx / GRID_RES, 0, GRID_COLS-1)))
+
+    def grid_to_world(self, r, c):
+        return (c+0.5)*GRID_RES, (r+0.5)*GRID_RES
+
+    def is_free(self, r, c):     return self.log_odds[r, c] <  FREE_THRESH
+    def is_unknown(self, r, c):  return FREE_THRESH <= self.log_odds[r, c] <= UNKNOWN_THRESH
+    def is_occupied(self, r, c): return self.log_odds[r, c] >  OCC_THRESH
+
+    def update(self, rx, ry, rtheta, scan):
+        angles = rtheta + np.linspace(0, 2*np.pi, N_BEAMS, endpoint=False)
+        for a, d in zip(angles, scan):
+            if d >= MAX_RANGE:
+                continue
+            n = int(d / GRID_RES)
+            for s in range(n):
+                r, c = self.world_to_grid(rx + np.cos(a)*s*GRID_RES,
+                                           ry + np.sin(a)*s*GRID_RES)
+                self.log_odds[r, c] = np.clip(self.log_odds[r,c]+L_FREE, L_MIN, L_MAX)
+            r, c = self.world_to_grid(rx + np.cos(a)*d, ry + np.sin(a)*d)
+            self.log_odds[r, c] = np.clip(self.log_odds[r,c]+L_OCC, L_MIN, L_MAX)
+
+    def probability_map(self):
+        return 1.0 / (1.0 + np.exp(-self.log_odds))
+
+    def build_inflation_mask(self):
+        occ  = self.log_odds > OCC_THRESH
+        mask = np.zeros_like(occ)
+        for r in range(GRID_ROWS):
+            for c in range(GRID_COLS):
+                if occ[r, c]:
+                    for dr in range(-INFLATION_RADIUS, INFLATION_RADIUS+1):
+                        for dc in range(-INFLATION_RADIUS, INFLATION_RADIUS+1):
+                            nr, nc = r+dr, c+dc
+                            if self.in_bounds(nr, nc):
+                                mask[nr, nc] = True
+        return mask
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  PARTICLE FILTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def init_particles(x, y, theta):
+    p = np.zeros((N_PARTICLES, 3))
+    p[:, 0]=x; p[:, 1]=y; p[:, 2]=theta
+    return p
+
+def predict(particles, dx, dy, dtheta):
+    particles[:,0] += dx + np.random.normal(0, MOTION_NOISE_XY, N_PARTICLES)
+    particles[:,1] += dy + np.random.normal(0, MOTION_NOISE_XY, N_PARTICLES)
+    particles[:,2] += dtheta + np.random.normal(0, MOTION_NOISE_TH, N_PARTICLES)
+    return particles
+
+def compute_weights(particles, z_actual):
+    log_w = np.zeros(N_PARTICLES)
+    for i, (px, py, pth) in enumerate(particles):
+        z_hat = take_scan(px, py, pth, noise_std=0.0)
+        log_w[i] = -0.5 * np.sum((z_actual-z_hat)**2) / SENSOR_NOISE_STD**2
+    log_w -= log_w.max()
+    w = np.exp(log_w); w /= w.sum()
+    return w
+
+def resample(particles, weights):
+    N=N_PARTICLES
+    pos=(np.arange(N)+np.random.uniform())/N
+    cum=np.cumsum(weights)
+    return particles[np.searchsorted(cum,pos)].copy()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  [REMOVED] WALL DISTANCE MAP  (medial axis removed in v4b)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# compute_wall_distance_map removed in v4b
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  FRONTIER DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+NEIGHBORS4 = [(-1,0),(1,0),(0,-1),(0,1)]
+
+def find_frontiers(grid):
+    frontier_set = set()
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            if not grid.is_free(r, c):
+                continue
+            for dr, dc in NEIGHBORS4:
+                nr, nc = r+dr, c+dc
+                if grid.in_bounds(nr, nc) and grid.is_unknown(nr, nc):
+                    frontier_set.add((r, c))
+                    break
+
+    visited, clusters = set(), []
+    for start in frontier_set:
+        if start in visited:
+            continue
+        cluster, queue = [], [start]
+        visited.add(start)
+        while queue:
+            cell = queue.pop()
+            cluster.append(cell)
+            r, c = cell
+            for dr, dc in NEIGHBORS4:
+                nb = (r+dr, c+dc)
+                if nb in frontier_set and nb not in visited:
+                    visited.add(nb); queue.append(nb)
+        if len(cluster) >= MIN_FRONTIER_SIZE:
+            clusters.append(cluster)
+    return clusters
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  DIJKSTRA  (used for scoring only — A* does the actual path planning)
+# ─────────────────────────────────────────────────────────────────────────────
+
+MOVES_8    = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+MOVE_COSTS = [1,1,1,1,1.414,1.414,1.414,1.414]
+
+def dijkstra_dist(grid, start_r, start_c, inflation_mask):
+    dist = np.full((GRID_ROWS, GRID_COLS), np.inf)
+    pred = {}
+    dist[start_r, start_c] = 0.0
+    heap = [(0.0, start_r, start_c)]
+    while heap:
+        d, r, c = heapq.heappop(heap)
+        if d > dist[r, c]:
+            continue
+        for (dr,dc), cost in zip(MOVES_8, MOVE_COSTS):
+            nr, nc = r+dr, c+dc
+            if not grid.in_bounds(nr, nc): continue
+            if inflation_mask[nr, nc]:     continue
+            if grid.is_occupied(nr, nc):   continue
+            nd = d + cost
+            if nd < dist[nr, nc]:
+                dist[nr, nc] = nd
+                pred[(nr, nc)] = (r, c)
+                heapq.heappush(heap, (nd, nr, nc))
+    return dist, pred
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  A*  (uniform edge weights — medial axis removed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def astar(grid, start_r, start_c, goal_r, goal_c, inflation_mask):
+    """
+    A* from start to goal with uniform edge weights.
+    Medial axis removed in v4b — sparse waypoint pruning handles path quality.
+    """
+    h = lambda r, c: np.hypot(r-goal_r, c-goal_c)
+    dist = np.full((GRID_ROWS, GRID_COLS), np.inf)
+    pred = {}
+    dist[start_r, start_c] = 0.0
+    heap = [(h(start_r, start_c), 0.0, start_r, start_c)]
+
+    while heap:
+        _, g, r, c = heapq.heappop(heap)
+        if g > dist[r, c]: continue
+        if (r, c) == (goal_r, goal_c):
+            break
+        for (dr,dc), cost in zip(MOVES_8, MOVE_COSTS):
+            nr, nc = r+dr, c+dc
+            if not grid.in_bounds(nr, nc): continue
+            if inflation_mask[nr, nc]:     continue
+            if grid.is_occupied(nr, nc):   continue
+            nd = g + cost
+            if nd < dist[nr, nc]:
+                dist[nr, nc] = nd
+                pred[(nr, nc)] = (r, c)
+                heapq.heappush(heap, (nd + h(nr, nc), nd, nr, nc))
+
+    if dist[goal_r, goal_c] == np.inf:
+        return None
+    path, cur = [], (goal_r, goal_c)
+    while cur != (start_r, start_c):
+        path.append(cur)
+        if cur not in pred: return None
+        cur = pred[cur]
+    path.append((start_r, start_c))
+    path.reverse()
+    return path
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. WAYPOINT PRUNING  (angle-tolerance, v4 style)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def prune_waypoints(path):
+    """
+    Keep only cells where the heading changes by more than WAYPOINT_ANGLE_TOL.
+    Collapses straight-corridor runs to just start+end.
+    REPLACED in v5c by LOS (line-of-sight) Bresenham pruning.
+    """
+    if len(path) <= 2:
+        return path
+    pruned = [path[0]]
+    prev_angle = np.arctan2(path[1][0]-path[0][0], path[1][1]-path[0][1])
+    for i in range(1, len(path)-1):
+        angle = np.arctan2(path[i+1][0]-path[i][0], path[i+1][1]-path[i][1])
+        if abs((angle - prev_angle + np.pi) % (2*np.pi) - np.pi) > WAYPOINT_ANGLE_TOL:
+            pruned.append(path[i])
+            prev_angle = angle
+    pruned.append(path[-1])
+    return pruned
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. FRONTIER SCORING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def information_gain(cluster_centroid, grid):
+    """Count unknown cells within sensor range of the frontier centroid."""
+    cr, cc = cluster_centroid
+    count  = 0
+    radius = int(MAX_RANGE / GRID_RES)
+    for dr in range(-radius, radius+1):
+        for dc in range(-radius, radius+1):
+            if dr**2 + dc**2 > radius**2:
+                continue
+            nr, nc = cr+dr, cc+dc
+            if grid.in_bounds(nr, nc) and grid.is_unknown(nr, nc):
+                count += 1
+    return count
+
+
+def cluster_certainty(cells, grid):
+    """
+    Mean |log_odds| of cluster member cells, normalised to [0,1].
+    Low value = cells near L=0 = barely observed boundary.
+    High value = clearly confirmed free↔unknown edge.
+    Added in v4c to reward well-observed frontiers.
+    """
+    if not cells:
+        return 0.0
+    return min(np.mean([abs(grid.log_odds[r, c]) for r, c in cells]) / L_MAX, 1.0)
+
+
+def merge_frontier_clusters(clusters):
+    """
+    Merge clusters whose centroids are within MERGE_RADIUS of each other.
+    Prevents the robot oscillating between adjacent small clusters
+    representing the same unexplored region.
+    Added in v4c.
+    """
+    if not clusters:
+        return clusters
+    centroids = [(int(np.mean([r for r,c in cl])),
+                  int(np.mean([c for r,c in cl]))) for cl in clusters]
+    merged = [False] * len(clusters)
+    result = []
+    for i in range(len(clusters)):
+        if merged[i]:
+            continue
+        combined = list(clusters[i])
+        for j in range(i+1, len(clusters)):
+            if merged[j]:
+                continue
+            cr1, cc1 = centroids[i]
+            cr2, cc2 = centroids[j]
+            if np.hypot(cr1-cr2, cc1-cc2) <= MERGE_RADIUS:
+                combined.extend(clusters[j])
+                merged[j] = True
+        result.append(combined)
+    return result
+
+
+def score_frontiers(frontiers, dist_map, grid, recency_scores,
+                    robot_heading=(1.0, 0.0)):
+    """
+    Scoring priority (v4c):
+      1. locality^2 * certainty  (dominant — prefer nearby, well-observed)
+      2. cluster size             (secondary)
+      3. recency                  (tiebreaker)
+    Plus directional heuristic: bonus for frontiers in current travel direction.
+
+    score = info_gain^1.5 / (path_dist+1)
+              * recency
+              * locality^2
+              * certainty
+              * direction_bonus
+    """
+    # First merge nearby clusters
+    frontiers = merge_frontier_clusters(frontiers)
+
+    scored = []
+    for cluster in frontiers:
+        cr = int(np.mean([r for r, c in cluster]))
+        cc = int(np.mean([c for r, c in cluster]))
+        d  = dist_map[cr, cc]
+        if np.isinf(d):
+            continue
+        ig        = information_gain((cr, cc), grid)
+        recency   = recency_scores.get((cr, cc), 1.0)
+        locality  = np.exp(-LOCALITY_LAMBDA * d) ** 2      # squared
+        certainty = cluster_certainty(cluster, grid)
+
+        # Directional heuristic: cos(angle between heading and frontier dir)
+        hx, hy = robot_heading
+        fx, fy = cc - 0, cr - 0   # rough direction (centroid relative)
+        fmag   = max(1e-6, np.hypot(fx, fy))
+        cos_a  = (hx*fx/fmag + hy*fy/fmag)
+        direction_bonus = 1.0 + DIRECTION_WEIGHT * max(0.0, cos_a)
+
+        score = (ig**1.5 / (d+1)) * recency * locality * certainty * direction_bonus
+        scored.append((score, (cr, cc), cluster))
+    scored.sort(reverse=True)
+    return scored
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. CONTROLLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def control_toward(rx, ry, rtheta, tx, ty):
+    dist = np.hypot(tx-rx, ty-ry)
+    if dist < ARRIVE_DIST:
+        return 0.0, 0.0, 0.0
+    target_angle = np.arctan2(ty-ry, tx-rx)
+    angle_err    = (target_angle - rtheta + np.pi) % (2*np.pi) - np.pi
+    dtheta       = np.clip(ANGULAR_GAIN * angle_err, -0.3, 0.3)
+    scale        = max(0.0, 1.0 - abs(angle_err)/(np.pi/4))
+    return np.cos(rtheta)*ROBOT_SPEED*scale, np.sin(rtheta)*ROBOT_SPEED*scale, dtheta
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. MAIN LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run():
+    true_x, true_y, true_theta = 1.0, 1.0, 0.0
+    particles  = init_particles(true_x, true_y, true_theta)
+    weights    = np.ones(N_PARTICLES) / N_PARTICLES
+    grid       = OccupancyGrid()
+    true_path  = [(true_x, true_y)]
+
+    # Seed initial scan
+    z0 = take_scan(true_x, true_y, true_theta, noise_std=SENSOR_NOISE_STD)
+    grid.update(true_x, true_y, true_theta, z0)
+
+    fig = plt.figure(figsize=(14, 6), facecolor='#1a1a2e')
+    gs  = GridSpec(1, 2, figure=fig, left=0.05, right=0.97)
+    ax1 = fig.add_subplot(gs[0]); ax2 = fig.add_subplot(gs[1])
+
+    # Exploration state
+    waypoints         = []
+    wp_idx            = 0
+    frontier_target   = None     # (cr, cc) centroid being chased
+    recency_scores    = {}       # (cr,cc) → float ≤ 1.0
+    steps_on_waypoint = 0
+    exploration_done  = False
+    need_replan       = True
+    heading_dx, heading_dy = 1.0, 0.0   # robot's recent travel direction (EMA-lite)
+
+    for step in range(3000):
+        if exploration_done:
+            break
+
+        # ── Replan ────────────────────────────────────────────────────────
+        if need_replan:
+            need_replan = False
+            inflation    = grid.build_inflation_mask()
+            robot_r, robot_c = grid.world_to_grid(true_x, true_y)
+            dist_map, pred_map = dijkstra_dist(grid, robot_r, robot_c, inflation)
+
+            frontiers = find_frontiers(grid)
+            if not frontiers:
+                print(f'Step {step}: No frontiers — exploration complete!'); break
+
+            scored = score_frontiers(frontiers, dist_map, grid, recency_scores,
+                                        robot_heading=(heading_dx, heading_dy))
+            for sc, centroid, cluster in scored:
+                cr, cc = centroid
+                path = astar(grid, robot_r, robot_c, cr, cc, inflation)
+                if path:
+                    waypoints       = prune_waypoints(path)
+                    wp_idx          = 1
+                    frontier_target = centroid
+                    steps_on_waypoint = 0
+                    break
+            else:
+                print(f'Step {step}: All frontiers unreachable.'); break
+
+        # ── Live centroid recomputation ────────────────────────────────────
+        if frontier_target:
+            current_frontiers = find_frontiers(grid)
+            # Find cluster closest to current target centroid
+            tr, tc = frontier_target
+            best_match = None; best_dist = np.inf
+            for cluster in current_frontiers:
+                cr = int(np.mean([r for r,c in cluster]))
+                cc = int(np.mean([c for r,c in cluster]))
+                d  = np.hypot(cr-tr, cc-tc)
+                if d < best_dist:
+                    best_dist = d; best_match = (cluster, cr, cc)
+
+            if best_match is None or best_dist > MAX_CENTROID_DRIFT:
+                # Cluster dissolved or drifted too far → replan
+                if frontier_target in recency_scores:
+                    recency_scores[frontier_target] *= RECENCY_DECAY
+                need_replan = True
+                continue
+
+            _, new_cr, new_cc = best_match
+            frontier_target = (new_cr, new_cc)   # chase live centroid
+
+        # ── Follow waypoints ───────────────────────────────────────────────
+        if wp_idx >= len(waypoints):
+            need_replan = True; continue
+
+        wr, wc = waypoints[wp_idx]
+        tx, ty = grid.grid_to_world(wr, wc)
+        dx, dy, dtheta = control_toward(true_x, true_y, true_theta, tx, ty)
+
+        if dx == 0 and dy == 0 and dtheta == 0:
+            wp_idx += 1; steps_on_waypoint = 0; continue
+
+        # v5b fix: only count steps where robot actually translates
+        # Previously counted every step including pure heading corrections,
+        # causing spurious timeouts on sharp turns.
+        if dx != 0 or dy != 0:
+            steps_on_waypoint += 1
+        if steps_on_waypoint > MAX_STEPS_PER_WAYPOINT:
+            if frontier_target:
+                recency_scores[frontier_target] = \
+                    recency_scores.get(frontier_target, 1.0) * RECENCY_DECAY
+            need_replan = True; continue
+
+        # Move
+        true_x     += dx; true_y += dy; true_theta += dtheta
+        true_theta  = (true_theta+np.pi)%(2*np.pi)-np.pi
+        if dx != 0 or dy != 0:
+            m = np.hypot(dx, dy)
+            heading_dx = 0.7*heading_dx + 0.3*(dx/m)
+            heading_dy = 0.7*heading_dy + 0.3*(dy/m)
+        true_x = np.clip(true_x, 0.1, WORLD_W-0.1)
+        true_y = np.clip(true_y, 0.1, WORLD_H-0.1)
+        true_path.append((true_x, true_y))
+
+        z = take_scan(true_x, true_y, true_theta, noise_std=SENSOR_NOISE_STD)
+        particles = predict(particles, dx, dy, dtheta)
+        weights   = compute_weights(particles, z)
+        particles = resample(particles, weights)
+
+        best = np.argmax(weights)
+        ex, ey, etheta = particles[best]
+        grid.update(ex, ey, etheta, z)
+
+        if step % 15 == 0:
+            prob = grid.probability_map()
+            fig.clf()
+            gs2  = GridSpec(1, 2, figure=fig, left=0.05, right=0.97)
+            ax1  = fig.add_subplot(gs2[0]); ax2 = fig.add_subplot(gs2[1])
+            for ax in (ax1,ax2): ax.set_facecolor('#16213e')
+
+            for x1,y1,x2,y2 in WALLS:
+                ax1.plot([x1,x2],[y1,y2],'w-',lw=1.5,alpha=0.8)
+            w_norm = weights/weights.max()
+            ax1.scatter(particles[:,0],particles[:,1],
+                        c=w_norm,cmap='plasma',s=6,alpha=0.6)
+            if len(true_path)>1:
+                px,py=zip(*true_path)
+                ax1.plot(px,py,'-',color='#2ecc71',lw=1,alpha=0.4)
+            ax1.plot(true_x,true_y,'o',color='#2ecc71',ms=7,zorder=5)
+            if frontier_target:
+                fwx,fwy = grid.grid_to_world(*frontier_target)
+                ax1.plot(fwx,fwy,'*',color='yellow',ms=12,zorder=6)
+            ax1.set_xlim(0,WORLD_W); ax1.set_ylim(0,WORLD_H); ax1.set_aspect('equal')
+            ax1.set_title('Ground truth + particles',color='white',fontsize=9)
+
+            ax2.imshow(prob,origin='lower',cmap='gray_r',
+                       extent=[0,WORLD_W,0,WORLD_H],vmin=0,vmax=1,
+                       interpolation='nearest')
+            for x1,y1,x2,y2 in WALLS:
+                ax2.plot([x1,x2],[y1,y2],'w-',lw=1.5,alpha=0.8)
+            ax2.plot(ex,ey,'s',color='#2ecc71',ms=8,zorder=6)
+            fcount = len(find_frontiers(grid))
+            ax2.set_title(f'Occupancy grid | frontiers={fcount}',
+                          color='white',fontsize=9)
+
+            err = np.sqrt((true_x-ex)**2+(true_y-ey)**2)
+            fig.suptitle(f'Step {step:4d}  |  err={err:.3f}m',
+                         color='white',fontsize=11)
+            fig.savefig(os.path.join(FRAMES_DIR,f'frame_{step:04d}.png'),
+                        dpi=100,bbox_inches='tight',
+                        facecolor=fig.get_facecolor())
+
+    plt.close(fig)
+    print(f'Saved frames to {FRAMES_DIR}/')
+
+
+if __name__ == '__main__':
+    np.random.seed(42)
+    run()
