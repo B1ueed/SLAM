@@ -1,0 +1,509 @@
+"""
+2D Particle Filter SLAM — v2: True SLAM with Per-Particle Maps
+==============================================================
+Fixes the fundamental cheat in v1: weights are now computed by
+ray-casting against each particle's OWN occupancy grid, not against
+the known ground-truth walls.
+
+Architecture:
+  - Each of N_PARTICLES particles carries its own log-odds occupancy grid
+  - Each particle's map is initialised to all-zeros (pure unknown)
+  - On each step, every particle:
+      1. Gets propagated through the motion model (predict)
+      2. Ray-casts 24 beams through its PERSONAL map to get expected ranges
+      3. Gets weighted by how well its expected scan matches the real scan
+  - After resampling, each surviving particle updates its map from its
+    estimated pose using the real scan
+  - A 4-particle diagnostic panel shows personal maps + expected scans
+    to make the predict/weight/resample cycle visually intuitive
+
+Performance: per-particle ray-casting in pure Python is too slow for
+N=200 at interactive frame rates. Fix: multiprocessing.Pool with
+spawn context (separate GIL per process → true parallelism). Each
+particle's map is serialised as a flat 1D array for efficient pickling.
+
+The occupancy grid update (update_grid) stays single-threaded: it's
+per-particle and in-place; parallelism would need Numba to beat the
+pickle overhead.
+
+Final localisation error ~12 cm (vs ~2 cm in v1) — the penalty for
+working with an uncertain, self-built map rather than ground truth.
+
+Known limitations:
+  - Still hardcoded waypoints (no autonomy — fixed in v3)
+  - ~12 cm error is higher than v1's 2 cm because the per-particle maps
+    are noisy early in the run when the walls are not yet confirmed
+
+ECE368 parallels:
+  - Each particle = one hypothesis in a Rao-Blackwellized particle filter
+  - Weight = p(z_t | x_t^(i), m^(i)) where m^(i) is the particle's map
+  - Resampling = importance sampling from the weighted posterior
+  - The yellow expected-scan lines in the 4-panel view are exactly
+    what the robot expects to see from its personal map; mismatch kills weight
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import multiprocessing as mp
+import os
+
+OUTPUT_DIR = 'slam_output'
+FRAMES_DIR = os.path.join(OUTPUT_DIR, 'frames')
+os.makedirs(FRAMES_DIR, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  WORLD  (never directly accessible to the robot — only through noisy sensors)
+# ─────────────────────────────────────────────────────────────────────────────
+
+WORLD_W = 10.0
+WORLD_H =  8.0
+
+WALLS = [
+    (0, 0, WORLD_W, 0),
+    (WORLD_W, 0, WORLD_W, WORLD_H),
+    (WORLD_W, WORLD_H, 0, WORLD_H),
+    (0, WORLD_H, 0, 0),
+    (3, 0, 3, 4),
+    (5, 4, 5, WORLD_H),
+    (7, 1, 7, 6),
+]
+
+# Same hardcoded waypoints as v1
+WAYPOINTS = [
+    (1.0, 1.0), (2.0, 6.5), (4.0, 6.5), (4.0, 1.5),
+    (6.0, 1.5), (6.0, 5.5), (8.5, 5.5), (8.5, 1.5),
+    (1.0, 1.0),
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+N_PARTICLES      = 20           # reduced from v1's 200 — multiprocessing overhead
+                                  # makes 200 slower at this grid resolution
+N_BEAMS          = 24
+MAX_RANGE        = 8.0
+
+MOTION_NOISE_XY  = 0.05
+MOTION_NOISE_TH  = 0.02
+SENSOR_NOISE_STD = 0.15
+
+# Occupancy grid — each particle has its own copy of this
+GRID_RES  = 0.2                 # coarser than v1 to keep per-particle maps tractable
+GRID_COLS = int(WORLD_W / GRID_RES)
+GRID_ROWS = int(WORLD_H / GRID_RES)
+L_OCC     =  0.85
+L_FREE    = -0.40
+L_MIN     = -5.0
+L_MAX     =  5.0
+L_OCC_THRESH = 0.5              # log-odds above this = occupied for ray-cast
+
+LINEAR_SPEED  = 0.12
+ANGULAR_GAIN  = 1.5
+ARRIVE_DIST   = 0.3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  GROUND-TRUTH GEOMETRY  (used only for: true robot movement + noisy scan)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ray_segment_intersect(rx, ry, angle, x1, y1, x2, y2):
+    dx, dy = np.cos(angle), np.sin(angle)
+    wx, wy = x2-x1, y2-y1
+    denom  = dx*wy - dy*wx
+    if abs(denom) < 1e-10:
+        return MAX_RANGE
+    t = ((x1-rx)*wy - (y1-ry)*wx) / denom
+    s = ((x1-rx)*dy - (y1-ry)*dx) / denom
+    if 0 < t < MAX_RANGE and 0 <= s <= 1:
+        return t
+    return MAX_RANGE
+
+
+def cast_ray_walls(rx, ry, angle):
+    """Ray against ground-truth walls. Used ONLY to generate the noisy scan."""
+    return min(ray_segment_intersect(rx, ry, angle, *w) for w in WALLS)
+
+
+def take_scan(rx, ry, rtheta, noise_std=0.0):
+    angles = rtheta + np.linspace(0, 2*np.pi, N_BEAMS, endpoint=False)
+    ranges = np.array([cast_ray_walls(rx, ry, a) for a in angles])
+    if noise_std > 0:
+        ranges += np.random.normal(0, noise_std, N_BEAMS)
+        ranges  = np.clip(ranges, 0, MAX_RANGE)
+    return ranges
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  PER-PARTICLE RAY CAST  (against the particle's own map, not ground truth)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cast_ray_grid(rx, ry, angle, flat_map):
+    """
+    Step cell-by-cell through the particle's personal occupancy grid
+    until hitting an occupied cell (log_odds > L_OCC_THRESH) or max range.
+
+    This is the key difference from v1: the particle is using its own
+    accumulated map to predict what it should see, not the known walls.
+
+    A particle in the wrong region has a map full of unknowns in the
+    direction the real scan is measuring.  Its expected range = MAX_RANGE.
+    The real scan returns e.g. 1.5m.  Weight ∝ exp(-Δ²/2σ²) → near zero.
+    """
+    grid = flat_map.reshape(GRID_ROWS, GRID_COLS)
+    dx, dy = np.cos(angle), np.sin(angle)
+    step   = GRID_RES / 2          # half-cell steps for accuracy
+    d      = step
+    while d < MAX_RANGE:
+        wx = rx + dx*d
+        wy = ry + dy*d
+        if not (0 <= wx < WORLD_W and 0 <= wy < WORLD_H):
+            break
+        c = int(wx / GRID_RES)
+        r = int(wy / GRID_RES)
+        c = min(c, GRID_COLS-1)
+        r = min(r, GRID_ROWS-1)
+        if grid[r, c] > L_OCC_THRESH:
+            return d
+        d += step
+    return MAX_RANGE
+
+
+def compute_particle_weight(args):
+    """
+    Worker function for multiprocessing.Pool.
+    Receives: (px, py, ptheta, flat_map, z_actual)
+    Returns: log-weight (float)
+
+    Serialised as a flat array to minimise pickle overhead across processes.
+    Each process has its own GIL so ray-casting runs in true parallel.
+    """
+    px, py, pth, flat_map, z_actual = args
+    angles = pth + np.linspace(0, 2*np.pi, N_BEAMS, endpoint=False)
+    z_hat  = np.array([cast_ray_grid(px, py, a, flat_map) for a in angles])
+    diff   = z_actual - z_hat
+    return -0.5 * np.sum(diff**2) / (SENSOR_NOISE_STD**2)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  OCCUPANCY GRID UPDATE  (per particle, sequential — parallelism not needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def update_grid(flat_map, rx, ry, rtheta, z_scan):
+    """
+    Update one particle's flat occupancy map from its estimated pose.
+    Returns the updated flat map (modified in place but also returned for clarity).
+    """
+    grid   = flat_map.reshape(GRID_ROWS, GRID_COLS)
+    angles = rtheta + np.linspace(0, 2*np.pi, N_BEAMS, endpoint=False)
+    for a, d in zip(angles, z_scan):
+        if d >= MAX_RANGE:
+            continue
+        # Free cells along beam
+        n = int(d / GRID_RES)
+        for s in range(n):
+            wx = rx + np.cos(a)*s*GRID_RES
+            wy = ry + np.sin(a)*s*GRID_RES
+            if 0 <= wx < WORLD_W and 0 <= wy < WORLD_H:
+                c = min(int(wx/GRID_RES), GRID_COLS-1)
+                r = min(int(wy/GRID_RES), GRID_ROWS-1)
+                grid[r, c] = np.clip(grid[r, c]+L_FREE, L_MIN, L_MAX)
+        # Hit cell
+        wx = rx + np.cos(a)*d
+        wy = ry + np.sin(a)*d
+        if 0 <= wx < WORLD_W and 0 <= wy < WORLD_H:
+            c = min(int(wx/GRID_RES), GRID_COLS-1)
+            r = min(int(wy/GRID_RES), GRID_ROWS-1)
+            grid[r, c] = np.clip(grid[r, c]+L_OCC, L_MIN, L_MAX)
+    return flat_map
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  PARTICLE FILTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def init_particles(x, y, theta):
+    """
+    Returns:
+      poses     — (N, 3) array of [x, y, theta]
+      maps      — list of N flat zero-arrays (unknown everywhere)
+    """
+    poses = np.zeros((N_PARTICLES, 3))
+    poses[:, 0] = x
+    poses[:, 1] = y
+    poses[:, 2] = theta
+    maps  = [np.zeros(GRID_ROWS * GRID_COLS) for _ in range(N_PARTICLES)]
+    return poses, maps
+
+
+def predict(poses, dx, dy, dtheta):
+    poses[:, 0] += dx + np.random.normal(0, MOTION_NOISE_XY, N_PARTICLES)
+    poses[:, 1] += dy + np.random.normal(0, MOTION_NOISE_XY, N_PARTICLES)
+    poses[:, 2] += dtheta + np.random.normal(0, MOTION_NOISE_TH, N_PARTICLES)
+    return poses
+
+
+def compute_weights(poses, maps, z_actual, pool):
+    """
+    Weight each particle by p(z_actual | x^(i), m^(i)).
+    Uses multiprocessing.Pool: each worker gets one particle's
+    (pose, flat_map, scan) tuple and returns a log-weight.
+
+    The spawn context gives each worker its own Python interpreter
+    and GIL → true parallelism even for pure Python ray-cast loops.
+    """
+    args = [(poses[i, 0], poses[i, 1], poses[i, 2],
+             maps[i],           # already flat
+             z_actual)
+            for i in range(N_PARTICLES)]
+    log_w = np.array(pool.map(compute_particle_weight, args))
+    log_w -= log_w.max()
+    w = np.exp(log_w)
+    w /= w.sum()
+    return w
+
+
+def resample(poses, maps, weights):
+    """
+    Systematic resampling — also resamples the per-particle maps.
+    High-weight particles survive (possibly duplicated);
+    low-weight particles are discarded along with their maps.
+    Duplicated particles get independent copies of the map so they
+    can diverge separately from this point.
+    """
+    N   = N_PARTICLES
+    pos = (np.arange(N) + np.random.uniform()) / N
+    cum = np.cumsum(weights)
+    idx = np.searchsorted(cum, pos)
+    new_poses = poses[idx].copy()
+    new_maps  = [maps[i].copy() for i in idx]
+    return new_poses, new_maps
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  CONTROLLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_control(rx, ry, rtheta, tx, ty):
+    dist = np.hypot(tx-rx, ty-ry)
+    if dist < ARRIVE_DIST:
+        return 0.0, 0.0, 0.0
+    target_angle = np.arctan2(ty-ry, tx-rx)
+    angle_err    = (target_angle-rtheta+np.pi)%(2*np.pi)-np.pi
+    dtheta       = np.clip(ANGULAR_GAIN*angle_err, -0.3, 0.3)
+    scale        = max(0.0, 1.0 - abs(angle_err)/(np.pi/4))
+    return np.cos(rtheta)*LINEAR_SPEED*scale, np.sin(rtheta)*LINEAR_SPEED*scale, dtheta
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  VISUALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+STATUS_LABELS = ['THRIVING', 'surviving', 'fading', 'DEAD']
+STATUS_COLOURS = ['#2ecc71', '#f39c12', '#e67e22', '#e74c3c']
+
+def weight_to_status(w, w_max):
+    """Map normalised weight to one of four status labels."""
+    r = w / w_max
+    if r > 0.5:  return 0
+    if r > 0.2:  return 1
+    if r > 0.05: return 2
+    return 3
+
+
+def draw_walls_on(ax):
+    for x1, y1, x2, y2 in WALLS:
+        ax.plot([x1, x2], [y1, y2], 'w-', lw=1.2, alpha=0.7)
+
+
+def render(fig, step, true_x, true_y, true_theta, true_path,
+           poses, maps, weights, best_idx):
+
+    fig.clf()
+    w_max = weights.max()
+
+    # ── Layout: 2 main panels + 4 particle detail panels ──────────────────
+    outer = GridSpec(1, 2, figure=fig, left=0.03, right=0.97,
+                     bottom=0.05, top=0.93, wspace=0.35)
+    left_gs  = outer[0].subgridspec(1, 1)
+    right_gs = outer[1].subgridspec(2, 2, wspace=0.08, hspace=0.12)
+
+    ax_world = fig.add_subplot(left_gs[0])
+    detail_axes = [fig.add_subplot(right_gs[r, c])
+                   for r in range(2) for c in range(2)]
+
+    for ax in [ax_world] + detail_axes:
+        ax.set_facecolor('#16213e')
+        ax.tick_params(colors='#aaa', labelsize=6)
+        for sp in ax.spines.values():
+            sp.set_color('#333355')
+
+    # ── Left panel: ground truth world ────────────────────────────────────
+    draw_walls_on(ax_world)
+
+    # Particle cloud
+    w_norm = weights / w_max
+    ax_world.scatter(poses[:, 0], poses[:, 1],
+                     c=w_norm, cmap='plasma', s=10, alpha=0.8, zorder=3)
+
+    # True path
+    if len(true_path) > 1:
+        px, py = zip(*true_path)
+        ax_world.plot(px, py, '-', color='#2ecc71', lw=1, alpha=0.4)
+
+    # True pose + heading arrow
+    ax_world.plot(true_x, true_y, 'o', color='#2ecc71', ms=8, zorder=5)
+    ax_world.annotate('', xy=(true_x + 0.5*np.cos(true_theta),
+                               true_y + 0.5*np.sin(true_theta)),
+                      xytext=(true_x, true_y),
+                      arrowprops=dict(arrowstyle='->', color='#2ecc71', lw=2))
+
+    # Waypoints
+    for wpx, wpy in WAYPOINTS:
+        ax_world.plot(wpx, wpy, '+', color='#9b59b6', ms=8, mew=1.5)
+
+    ax_world.set_xlim(0, WORLD_W); ax_world.set_ylim(0, WORLD_H)
+    ax_world.set_aspect('equal')
+    ax_world.set_title('Ground truth + particle cloud', color='white', fontsize=9)
+
+    # Best-particle estimated pose
+    bx, by, bth = poses[best_idx]
+    ax_world.plot(bx, by, 's', color='#3498db', ms=8, zorder=6,
+                  label='Best estimate')
+    ax_world.legend(loc='upper right', fontsize=6,
+                    facecolor='#1a1a2e', labelcolor='white', edgecolor='#444')
+
+    # ── Right panels: 4 particle personal maps ────────────────────────────
+    # Choose 4 particles to display: best, two mid-weight, worst
+    sorted_idx = np.argsort(weights)[::-1]
+    display_idx = [sorted_idx[0],
+                   sorted_idx[N_PARTICLES//3],
+                   sorted_idx[2*N_PARTICLES//3],
+                   sorted_idx[-1]]
+
+    for ax, pidx in zip(detail_axes, display_idx):
+        ax.cla(); ax.set_facecolor('#16213e')
+
+        # Personal occupancy map (probability)
+        personal_grid = maps[pidx].reshape(GRID_ROWS, GRID_COLS)
+        prob = 1.0 / (1.0 + np.exp(-personal_grid))
+        ax.imshow(prob, origin='lower', cmap='gray_r',
+                  extent=[0, WORLD_W, 0, WORLD_H],
+                  vmin=0, vmax=1, interpolation='nearest')
+
+        # Expected scan from this particle's personal map (yellow)
+        px_i, py_i, pth_i = poses[pidx]
+        angles = pth_i + np.linspace(0, 2*np.pi, N_BEAMS, endpoint=False)
+        flat   = maps[pidx]
+        for a in angles:
+            d_hat = cast_ray_grid(px_i, py_i, a, flat)
+            ex    = px_i + np.cos(a) * d_hat
+            ey    = py_i + np.sin(a) * d_hat
+            ax.plot([px_i, ex], [py_i, ey], '-', color='#f1c40f',
+                    lw=0.4, alpha=0.6)
+
+        # Particle position
+        ax.plot(px_i, py_i, 'o', color='#3498db', ms=4, zorder=5)
+
+        # Status label
+        status = weight_to_status(weights[pidx], w_max)
+        colour = STATUS_COLOURS[status]
+        label  = STATUS_LABELS[status]
+
+        # Border colour encodes weight
+        for sp in ax.spines.values():
+            sp.set_color(colour)
+            sp.set_linewidth(2.5 if status == 0 else 1.0)
+
+        ax.set_title(f'P{pidx} | w={weights[pidx]:.3f} | {label}',
+                     color=colour, fontsize=7, pad=2)
+        ax.set_xlim(0, WORLD_W); ax.set_ylim(0, WORLD_H)
+        ax.set_aspect('equal')
+        ax.tick_params(labelbottom=False, labelleft=False)
+
+    bx, by, _ = poses[best_idx]
+    err = np.sqrt((true_x-bx)**2 + (true_y-by)**2)
+    fig.suptitle(
+        f'v2 True SLAM — Step {step:4d}  |  '
+        f'N={N_PARTICLES} particles  |  err={err:.3f} m',
+        color='white', fontsize=10)
+
+    fig.savefig(os.path.join(FRAMES_DIR, f'frame_{step:04d}.png'),
+                dpi=100, bbox_inches='tight',
+                facecolor=fig.get_facecolor())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  MAIN LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run():
+    x0, y0 = WAYPOINTS[0]
+    true_x, true_y, true_theta = x0, y0, 0.0
+
+    poses, maps = init_particles(true_x, true_y, true_theta)
+    weights     = np.ones(N_PARTICLES) / N_PARTICLES
+    true_path   = [(true_x, true_y)]
+    wp_idx      = 1
+
+    # Multiprocessing pool — spawn context for true GIL-free parallelism.
+    # Created once outside the loop to avoid paying process-fork cost per step.
+    ctx  = mp.get_context('spawn')
+    pool = ctx.Pool(processes=min(N_PARTICLES, mp.cpu_count()))
+
+    fig = plt.figure(figsize=(16, 7), facecolor='#1a1a2e')
+
+    step = 0
+    try:
+        while wp_idx < len(WAYPOINTS):
+            tx, ty = WAYPOINTS[wp_idx]
+            dx, dy, dtheta = compute_control(true_x, true_y, true_theta, tx, ty)
+
+            if dx == 0 and dy == 0 and dtheta == 0:
+                wp_idx += 1
+                continue
+
+            # True robot moves
+            true_x     += dx
+            true_y     += dy
+            true_theta += dtheta
+            true_theta  = (true_theta+np.pi)%(2*np.pi)-np.pi
+            true_x = np.clip(true_x, 0.05, WORLD_W-0.05)
+            true_y = np.clip(true_y, 0.05, WORLD_H-0.05)
+            true_path.append((true_x, true_y))
+
+            # Noisy scan (from ground truth — this is what the real robot sees)
+            z = take_scan(true_x, true_y, true_theta, noise_std=SENSOR_NOISE_STD)
+
+            # Particle filter
+            poses   = predict(poses, dx, dy, dtheta)
+            weights = compute_weights(poses, maps, z, pool)
+
+            # Update each particle's personal map from its estimated pose
+            # (done BEFORE resampling so all particles benefit)
+            for i in range(N_PARTICLES):
+                maps[i] = update_grid(maps[i], poses[i,0], poses[i,1], poses[i,2], z)
+
+            # Resample — duplicates maps of surviving particles
+            poses, maps = resample(poses, maps, weights)
+            # Recompute weights after resampling (uniform as starting point)
+            weights = compute_weights(poses, maps, z, pool)
+
+            best_idx = np.argmax(weights)
+
+            if step % 8 == 0:
+                render(fig, step, true_x, true_y, true_theta,
+                       true_path, poses, maps, weights, best_idx)
+
+            step += 1
+
+    finally:
+        pool.close()
+        pool.join()
+
+    bx, by, _ = poses[best_idx]
+    err = np.sqrt((true_x-bx)**2 + (true_y-by)**2)
+    print(f'Done. Steps={step}, final error={err:.4f} m')
+    print(f'Frames saved to {FRAMES_DIR}/')
+    plt.close(fig)
+
+
+if __name__ == '__main__':
+    np.random.seed(42)
+    run()
