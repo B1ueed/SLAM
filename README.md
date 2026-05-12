@@ -1,4 +1,4 @@
-# 2D Particle Filter SLAM: A Research Log
+# 2D Particle Filter SLAM: An Exploration Log
 
 ## Overview
 
